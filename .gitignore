@@ -1,0 +1,62 @@
+# ------------------------------------------------------------------
+# lambda-utils .gitignore
+# Patterns without a leading "/" apply in every subdirectory, so new
+# utility directories are covered automatically.
+# To deliberately commit an ignored file:  git add -f <file>
+# ------------------------------------------------------------------
+
+# --- Python environments & caches ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
+
+# --- Captured / processed data ---
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.fits
+*.bin
+*.dat
+*.raw
+
+# --- Generated plots / images ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+
+# --- Generated summaries / spreadsheets ---
+*.xls
+*.xlsx
+*.xlsm
+*summary*.csv
+
+# --- Logs & temp ---
+*.log
+*.tmp
+*.bak
+*~
+*.swp
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
