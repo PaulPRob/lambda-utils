@@ -62,6 +62,11 @@ KURT_LIMIT = 1.0           # |excess kurtosis| above: impulsive RFI, stuck bits 
 FM_WARN_DB = 10.0          # FM band mean PSD above median floor: below this the FM is weak
 FM_FAIL_DB = 3.0           # ...below this there is effectively no FM, receiver chain suspect
 OK, WARN, BAD = 0, 1, 2
+
+# noise density in quiet bands, compared with the ADC's own floor (CSV export)
+ADC_ENOB = 10.5            # AD9695-1300, standard full-scale range, ~250 MHz input
+NOISE_NFFT = 16384         # 48.8 kHz bins at 800 MS/s, 7 averages over a 65536-sample buffer
+NOISE_BANDS_MHZ = [(2, 20), (150, 176), (190, 210), (290, 310), (340, 370)]
 LEVEL_COLORS = {OK: "#2e8b57", WARN: "#d98c00", BAD: "#cc2222"}
 
 
@@ -171,6 +176,28 @@ def fm_band_metrics(frac, power, w, fs, bits):
     return band_dbfs, above_floor
 
 
+def adc_noise_density(fs, enob):
+    """ADC noise density (dBFS/Hz) implied by ENOB, taking the noise as white over 0..fs/2."""
+    return -(6.02 * enob + 1.76) - 10 * np.log10(fs / 2)
+
+
+def band_noise_densities(codes, fs, bits):
+    """Median noise density (dBFS/Hz) in each of NOISE_BANDS_MHZ; the median ignores narrow spurs.
+
+    None for a band when fs is unknown or the band lies above Nyquist."""
+    if not fs:
+        return [None] * len(NOISE_BANDS_MHZ)
+    frac, power, w, _ = welch_power(codes - codes.mean(), NOISE_NFFT, "Hann")
+    full_scale_sine_ms = 2 ** (2 * (bits - 1)) / 2
+    density = 2 * power / (fs * np.sum(w ** 2)) / full_scale_sine_ms  # one-sided, per Hz, re full-scale sine
+    f = frac * fs
+    out = []
+    for lo, hi in NOISE_BANDS_MHZ:
+        band = (f >= lo * 1e6) & (f <= hi * 1e6)
+        out.append(10 * np.log10(np.median(density[band])) if hi * 1e6 <= fs / 2 and band.any() else None)
+    return out
+
+
 def channel_metrics(codes, bits, fs):
     """Health metrics for the channel grid, each with an OK/WARN/BAD level."""
     s = compute_stats(codes, bits)
@@ -187,6 +214,7 @@ def channel_metrics(codes, bits, fs):
         **s,
         "fm_dbfs": fm_dbfs,
         "fm_above": fm_above,
+        "band_nsd": band_noise_densities(codes, fs, bits),
         "levels": levels,
         "level": max(levels.values()),
         "frac": frac,
@@ -400,7 +428,7 @@ class ChannelColumn(QtWidgets.QWidget):
         self.c_time.setData(np.arange(codes.size), codes, symbol="o" if v.markers_cb.isChecked() else None)
 
         # spectrum
-        frac, dbfs, n_avg = spectrum_dbfs(codes, v.nfft(), v.window_cb.currentText(), bits)
+        frac, dbfs, n_avg = spectrum_dbfs(codes, v.nfft(), v.window_name(), bits)
         self.c_spec.setData(frac, dbfs)
         search = dbfs[DC_EXCLUDE_BINS:]
         ipk = DC_EXCLUDE_BINS + int(np.argmax(search)) if search.size else 0
@@ -497,6 +525,10 @@ class Viewer(QtWidgets.QMainWindow):
             self.nfft_cb.addItem(f"{n:,}", n)
         self.nfft_cb.setCurrentIndex(FFT_LENGTHS.index(args.nfft) if args.nfft in FFT_LENGTHS else len(FFT_LENGTHS) - 1)
         self.nfft_cb.setToolTip("FFT length. Shorter than the buffer = Welch averaging (50 % overlap), smoother noise floor")
+        self.welch_cb = QtWidgets.QCheckBox(f"Smoothed (Welch {GRID_NFFT:,})", checked=args.welch)
+        self.welch_cb.setToolTip(
+            f"Same spectrum as the All channels grid: {GRID_NFFT:,}-point Hann FFTs, 50 % overlap, averaged.\n"
+            "Untick for the FFT length and window chosen on the left.")
         self.hist_log_cb = QtWidgets.QCheckBox("Histogram log Y")
         self.hist_log_cb.setToolTip("Log count axis: makes non-Gaussian tails and outliers visible")
         self.gauss_cb = QtWidgets.QCheckBox("Gaussian fit", checked=True)
@@ -518,15 +550,21 @@ class Viewer(QtWidgets.QMainWindow):
         for label, w in (("Fs ", self.fs_spin), ("  Window ", self.window_cb), ("  FFT length ", self.nfft_cb)):
             bar.addWidget(QtWidgets.QLabel(label))
             bar.addWidget(w)
+        bar.addWidget(self.welch_cb)
         bar.addSeparator()
         for w in (self.hist_log_cb, self.gauss_cb, self.markers_cb):
             bar.addWidget(w)
-        bar.addSeparator()
+
+        # second row: zoom/navigation and output
+        self.addToolBarBreak()
+        bar2 = QtWidgets.QToolBar("View")
+        bar2.setMovable(False)
+        self.addToolBar(bar2)
         for w in (self.link_cb, self.lock_y_cb, self.box_cb, reset_btn):
-            bar.addWidget(w)
-        bar.addSeparator()
-        bar.addWidget(png_btn)
-        bar.addWidget(grid_btn)
+            bar2.addWidget(w)
+        bar2.addSeparator()
+        bar2.addWidget(png_btn)
+        bar2.addWidget(grid_btn)
 
         self.columns = [ChannelColumn("A", CHANNEL_COLORS[0], self), ChannelColumn("B", CHANNEL_COLORS[1], self)]
         splitter = QtWidgets.QSplitter()
@@ -538,6 +576,7 @@ class Viewer(QtWidgets.QMainWindow):
             "right-click: menu / export")
 
         self.fs_spin.valueChanged.connect(self.refresh)
+        self.welch_cb.toggled.connect(self.apply_welch)
         for w in (self.window_cb, self.nfft_cb):
             w.currentIndexChanged.connect(self.refresh)
         for w in (self.gauss_cb, self.markers_cb):
@@ -553,6 +592,8 @@ class Viewer(QtWidgets.QMainWindow):
 
         self.apply_link()
         self.apply_mouse_mode()
+        for w in (self.window_cb, self.nfft_cb):
+            w.setEnabled(not self.welch_cb.isChecked())
 
         files = args.files or [str(f) for f in DEFAULT_FILES]
         for col, f in zip(self.columns, files):
@@ -587,7 +628,15 @@ class Viewer(QtWidgets.QMainWindow):
         return self.fs_spin.value() * 1e6
 
     def nfft(self):
-        return self.nfft_cb.currentData()
+        return GRID_NFFT if self.welch_cb.isChecked() else self.nfft_cb.currentData()
+
+    def window_name(self):
+        return "Hann" if self.welch_cb.isChecked() else self.window_cb.currentText()
+
+    def apply_welch(self):
+        for w in (self.window_cb, self.nfft_cb):
+            w.setEnabled(not self.welch_cb.isChecked())
+        self.refresh()
 
     def refresh(self):
         for c in self.columns:
@@ -829,29 +878,47 @@ class ChannelGridWindow(QtWidgets.QMainWindow):
         name = "channel_grid_" + group.replace("*", "N") + ".png"
         save_widget_png(self, self.scroll.widget(), self.directory, name, self.statusBar())
 
+    @staticmethod
+    def band_cells(m, adc_nsd):
+        """Per band: measured noise density (dBFS/Hz) and how far it sits above the ADC floor (dB)."""
+        cells = []
+        for nsd in m["band_nsd"]:
+            if nsd is None or adc_nsd is None:
+                cells += ["" if nsd is None else f"{nsd:.2f}", ""]
+            else:
+                cells += [f"{nsd:.2f}", f"{nsd - adc_nsd:.2f}"]
+        return cells
+
     def save_csv(self):
         fname, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save channel summary", str(self.directory / "channel_summary.csv"), "CSV (*.csv)")
         if not fname:
             return
         status = {OK: "OK", WARN: "WARN", BAD: "BAD"}
+        fs = self.viewer.fs_hz()
+        adc_nsd = adc_noise_density(fs, self.viewer.args.enob) if fs else None
+        band_cols = []
+        for lo, hi in NOISE_BANDS_MHZ:
+            band_cols += [f"nsd_{lo}_{hi}MHz_dbfs_hz", f"above_adc_{lo}_{hi}MHz_db"]
         with open(fname, "w", newline="") as fh:
             out = csv.writer(fh)
             out.writerow(["capture", "channel", "file", "rms_codes", "rms_dbfs", "mean", "std", "skew",
-                          "excess_kurtosis", "clipped", "fm_band_dbfs", "fm_above_floor_db", "status"])
+                          "excess_kurtosis", "clipped", "fm_band_dbfs", "fm_above_floor_db", "status",
+                          "adc_floor_dbfs_hz", *band_cols])
             for name, files in self.groups.items():
                 for ch in range(max(files) + 1):
                     path = files.get(ch)
                     m = self.metrics.get(path) if path else None
                     if m is None:
                         out.writerow([name, ch, path.name if path else "", *[""] * 9,
-                                      "MISSING" if path is None else "UNREADABLE"])
+                                      "MISSING" if path is None else "UNREADABLE", *[""] * (1 + len(band_cols))])
                         continue
                     fm = ["" if m["fm_dbfs"] is None else f"{m['fm_dbfs']:.2f}",
                           "" if m["fm_above"] is None else f"{m['fm_above']:.2f}"]
                     out.writerow([name, ch, path.name, f"{m['rms']:.3f}", f"{m['rms_dbfs']:.2f}",
                                   f"{m['mean']:.3f}", f"{m['std']:.3f}", f"{m['skew']:.4f}", f"{m['kurt']:.4f}",
-                                  m["clip"], *fm, status[m["level"]]])
+                                  m["clip"], *fm, status[m["level"]],
+                                  "" if adc_nsd is None else f"{adc_nsd:.2f}", *self.band_cells(m, adc_nsd)])
         self.statusBar().showMessage(f"Saved {fname}", 5000)
 
 
@@ -862,10 +929,14 @@ def parse_args(argv):
                     help=f"sample rate in MHz (default {DEFAULT_FS_MHZ:g}; 0 = axes in samples)")
     ap.add_argument("--bits", type=int, default=DEFAULT_BITS,
                     help=f"ADC resolution, sets dBFS and clipping levels (default {DEFAULT_BITS})")
+    ap.add_argument("--enob", type=float, default=ADC_ENOB,
+                    help=f"ADC effective bits, sets the ADC noise floor in the CSV export (default {ADC_ENOB:g})")
     ap.add_argument("--shift", default="auto",
                     help="right-shift applied to stored samples; 'auto' strips low bits that are always zero")
     ap.add_argument("--nfft", type=int, default=65536, choices=FFT_LENGTHS, help="FFT length (default 65536)")
     ap.add_argument("--window", default="Hann", choices=WINDOWS, help="FFT window (default Hann)")
+    ap.add_argument("--welch", action="store_true",
+                    help=f"start with the smoothed Welch spectrum ({GRID_NFFT}-point, as in the grid)")
     ap.add_argument("--grid", action="store_true", help="also open the all-channels health grid")
     args = ap.parse_args(argv)
     if len(args.files) > 2:
