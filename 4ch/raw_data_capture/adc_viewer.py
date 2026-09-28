@@ -8,8 +8,9 @@ Shows two captures side by side. Each column has:
        (mean, std, RMS, skew, excess kurtosis, clipping, unused codes)
 
 Usage:
-    .venv/bin/python adc_viewer.py                    # default chan0 / chan1 pair
-    .venv/bin/python adc_viewer.py FILE_A [FILE_B]    # choose files
+    .venv/bin/python adc_viewer.py                    # lowest two channels of the newest capture in .
+    .venv/bin/python adc_viewer.py --dir DATA_DIR     # ...of the newest capture in DATA_DIR
+    .venv/bin/python adc_viewer.py FILE_A [FILE_B]    # choose files (any directory)
     .venv/bin/python adc_viewer.py --fs 800           # sample rate in MHz (default 800, 0 = axes in samples)
     .venv/bin/python adc_viewer.py --grid             # also open the all-channels health grid
 
@@ -39,11 +40,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_FILES = [
-    SCRIPT_DIR / "adc_raw_alveo0_chan0_20260925_093522.npy",
-    SCRIPT_DIR / "adc_raw_alveo0_chan1_20260925_093522.npy",
-]
+TIMESTAMP_RE = re.compile(r"\d{8}_\d{6}")  # YYYYMMDD_HHMMSS in capture file names
 FILE_FILTER = "NumPy arrays (*.npy);;Raw int16 (*.bin *.dat *.raw);;All files (*)"
 CHANNEL_COLORS = ["#1f6fb4", "#d9661f"]
 FFT_LENGTHS = [256, 1024, 4096, 16384, 65536]
@@ -239,6 +236,24 @@ def capture_groups(directory, suffix=".npy"):
     return {k: dict(sorted(groups[k].items())) for k in sorted(groups, key=natural_key)}
 
 
+def default_files(directory):
+    """Files shown at start-up: the two lowest channels of the newest capture in `directory`.
+
+    Newest is judged by the YYYYMMDD_HHMMSS stamp in the name, then by modification time.
+    Falls back to the first two .npy files when none are named *chanN*."""
+    groups = capture_groups(directory)
+    if not groups:
+        return sorted(Path(directory).glob("*.npy"), key=natural_key)[:2]
+
+    def age(item):
+        name, files = item
+        stamps = TIMESTAMP_RE.findall(name)
+        return stamps[-1] if stamps else "", max(p.stat().st_mtime for p in files.values())
+
+    _, files = max(groups.items(), key=age)
+    return list(files.values())[:2]
+
+
 # --------------------------------------------------------------------------- widgets
 
 
@@ -361,13 +376,13 @@ class ChannelColumn(QtWidgets.QWidget):
     # ---- file handling
 
     def choose_file(self):
-        start = str(self.path.parent if self.path else SCRIPT_DIR)
+        start = str(self.path.parent if self.path else self.viewer.args.dir)
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Open file for column {self.title}", start, FILE_FILTER)
         if fname:
             self.load(fname)
 
     def save_png(self):
-        directory = self.path.parent if self.path else SCRIPT_DIR
+        directory = self.path.parent if self.path else self.viewer.args.dir
         name = f"{self.path.stem if self.path else 'column_' + self.title}.png"
         save_widget_png(self, self, directory, name, self.viewer.statusBar())
 
@@ -508,7 +523,7 @@ class Viewer(QtWidgets.QMainWindow):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.setWindowTitle("ADC raw data viewer")
+        self.setWindowTitle(f"ADC raw data viewer — {args.dir}")
         self.resize(1500, 1000)
 
         # global controls
@@ -595,14 +610,16 @@ class Viewer(QtWidgets.QMainWindow):
         for w in (self.window_cb, self.nfft_cb):
             w.setEnabled(not self.welch_cb.isChecked())
 
-        files = args.files or [str(f) for f in DEFAULT_FILES]
+        files = args.files or default_files(args.dir)
         for col, f in zip(self.columns, files):
             col.load(f)
+        if not files:
+            self.statusBar().showMessage(f"No .npy captures in {args.dir} — use Open file A…/B… or --dir")
 
     def show_grid(self):
         if self.grid is None:
             path = self.columns[0].path
-            self.grid = ChannelGridWindow(self, path.parent if path else SCRIPT_DIR)
+            self.grid = ChannelGridWindow(self, path.parent if path else self.args.dir)
             self.fs_spin.valueChanged.connect(self.grid.rescan)
         self.grid.show()
         self.grid.raise_()
@@ -611,7 +628,7 @@ class Viewer(QtWidgets.QMainWindow):
     def save_png(self):
         paths = [c.path for c in self.columns if c.path]
         name = "__".join(p.stem for p in paths) + ".png" if paths else "adc_viewer.png"
-        directory = paths[0].parent if paths else SCRIPT_DIR
+        directory = paths[0].parent if paths else self.args.dir
         save_widget_png(self, self.centralWidget(), directory, name, self.statusBar())
 
     def show_in_column(self, index, path):
@@ -924,7 +941,11 @@ class ChannelGridWindow(QtWidgets.QMainWindow):
 
 def parse_args(argv):
     ap = argparse.ArgumentParser(description="View raw 14-bit ADC captures: time, spectrum and histogram.")
-    ap.add_argument("files", nargs="*", help="up to two capture files (default: alveo0 chan0 and chan1)")
+    ap.add_argument("files", nargs="*",
+                    help="up to two capture files (default: lowest two channels of the newest capture in --dir)")
+    ap.add_argument("--dir", type=Path, default=None,
+                    help="data directory: start-up files, file dialogs and the channel grid start here "
+                         "(default: current directory)")
     ap.add_argument("--fs", type=float, default=DEFAULT_FS_MHZ,
                     help=f"sample rate in MHz (default {DEFAULT_FS_MHZ:g}; 0 = axes in samples)")
     ap.add_argument("--bits", type=int, default=DEFAULT_BITS,
@@ -941,6 +962,9 @@ def parse_args(argv):
     args = ap.parse_args(argv)
     if len(args.files) > 2:
         ap.error("at most two files can be shown")
+    args.dir = (args.dir or Path.cwd()).expanduser().resolve()
+    if not args.dir.is_dir():
+        ap.error(f"--dir {args.dir} is not a directory")
     return args
 
 
